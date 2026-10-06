@@ -6,6 +6,8 @@ import { createLoginGateway, type LoginGateway } from '../src/gateway.ts'
 import { hashPassword } from '../src/password.ts'
 import { generateTotp, generateTotpSecret } from '../src/totp.ts'
 import { createUpstreamCookieProvider } from '../src/upstream-auth.ts'
+import { createUserDirectory } from '../src/user-store.ts'
+import { createFakeCredentials, type FakeCredentials } from './helpers/credentials.ts'
 import { startFakeUpstream, type FakeUpstream } from './helpers/upstream.ts'
 
 const PASSWORD = 'correct horse battery staple'
@@ -51,14 +53,14 @@ async function login(options: {
 }
 
 /** Open one WebSocket-shaped upgrade and read its status line and headers. */
-function upgrade(path: string, cookie?: string): Promise<{ status: number; socket: Socket }> {
+function upgrade(path: string, cookie?: string, target: string = base): Promise<{ status: number; socket: Socket }> {
   return new Promise((resolve, reject) => {
-    const socket = connect(Number(new URL(base).port), '127.0.0.1')
+    const socket = connect(Number(new URL(target).port), '127.0.0.1')
     socket.once('error', reject)
     socket.once('connect', () => {
       const lines = [
         `GET ${path} HTTP/1.1`,
-        `host: ${hostOf(base)}`,
+        `host: ${hostOf(target)}`,
         'upgrade: websocket',
         'connection: Upgrade',
         'sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==',
@@ -105,8 +107,10 @@ beforeEach(async () => {
       return url.href
     },
   })
-  gateway = createLoginGateway(resolveConfig(config, upstream.port), {
+  const resolved = resolveConfig(config, upstream.port)
+  gateway = createLoginGateway(resolved, {
     upstreamCookie: authority => cookies.cookieFor(authority),
+    users: createUserDirectory(resolved.users, undefined),
     logger: { info: () => {}, warn: () => {} },
   })
   await gateway.start()
@@ -314,6 +318,144 @@ describe('upgrades', () => {
     })
     socket.write('ping')
     await expect(echoed).resolves.toBe('ping')
+    socket.destroy()
+  })
+})
+
+describe('first-run setup', () => {
+  const SETUP_PASSWORD = 'a-long-enough-password'
+  let setupGateway: LoginGateway
+  let credentials: FakeCredentials
+  let setupBase: string
+
+  beforeEach(async () => {
+    credentials = createFakeCredentials()
+    const config: LoginGatewayConfig = {
+      listenHost: '127.0.0.1',
+      listenPort: 0,
+      upstreamHost: '127.0.0.1',
+      upstreamPort: upstream.port,
+      loginPath: '/login',
+      logoutPath: '/logout',
+      users: [],
+      session: { maxAgeSeconds: 3600, cookieName: 'gw_session', secure: 'never' },
+    }
+    const resolved = resolveConfig(config, upstream.port)
+    const cookies = createUpstreamCookieProvider({
+      upstream: { host: '127.0.0.1', port: upstream.port },
+      authenticatedUrl: (baseUrl) => {
+        const url = new URL(baseUrl)
+        url.searchParams.set('token', upstream.launchToken)
+        return url.href
+      },
+    })
+    setupGateway = createLoginGateway(resolved, {
+      upstreamCookie: authority => cookies.cookieFor(authority),
+      users: createUserDirectory([], credentials),
+      logger: { info: () => {}, warn: () => {} },
+    })
+    await setupGateway.start()
+    setupBase = setupGateway.url
+  })
+
+  afterEach(async () => {
+    await setupGateway.stop()
+  })
+
+  async function createAccount(body: Record<string, string>): Promise<Response> {
+    return await fetch(`${setupBase}/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', origin: setupBase },
+      body: new URLSearchParams(body),
+      redirect: 'manual',
+    })
+  }
+
+  it('serves the setup form and refuses every other path', async () => {
+    expect(setupGateway.configured).toBe(false)
+    const form = await fetch(`${setupBase}/login`, { headers: { 'sec-fetch-dest': 'document' } })
+    expect(form.status).toBe(200)
+    expect(await form.text()).toContain('Create the first account')
+
+    const api = await fetch(`${setupBase}/api/sessions`)
+    expect(api.status).toBe(503)
+    await expect(api.json()).resolves.toEqual({ error: 'not-configured' })
+
+    const page = await fetch(`${setupBase}/`, { headers: { 'sec-fetch-dest': 'document' } })
+    expect(page.status).toBe(503)
+    expect(await page.text()).toContain('Not configured')
+  })
+
+  it('exchanges the setup token for a cookie and refuses a wrong one', async () => {
+    const exchanged = await fetch(`${setupBase}/login?setup=${setupGateway.setupToken}`, { redirect: 'manual' })
+    expect(exchanged.status).toBe(303)
+    expect(exchanged.headers.get('location')).toBe('/login')
+    const cookie = exchanged.headers.getSetCookie()[0]?.split(';')[0] ?? ''
+    expect(cookie).toContain('dsh_login_setup=')
+
+    const wrong = await fetch(`${setupBase}/login?setup=nope`, { redirect: 'manual' })
+    expect(wrong.status).toBe(403)
+    expect(await wrong.text()).toContain('Setup is local-only')
+  })
+
+  it('creates the first account, enrolls the secret, and signs in with it', async () => {
+    const created = await createAccount({
+      username: 'alice',
+      password: SETUP_PASSWORD,
+      confirm: SETUP_PASSWORD,
+    })
+    expect(created.status).toBe(200)
+    const enrollment = await created.text()
+    expect(enrollment).toContain('Add the authenticator')
+    expect(enrollment).toContain('otpauth://totp/')
+    expect(credentials.records.has('login-gateway/alice')).toBe(true)
+    expect(setupGateway.configured).toBe(true)
+
+    const secret = /value="([A-Z2-7 ]{8,})"/u.exec(enrollment)?.[1]?.replaceAll(' ', '')
+    expect(secret).toBeDefined()
+    const login = await fetch(`${setupBase}/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', origin: setupBase },
+      body: new URLSearchParams({
+        username: 'alice',
+        password: SETUP_PASSWORD,
+        otp: generateTotp(secret ?? '') ?? '',
+      }),
+      redirect: 'manual',
+    })
+    expect(login.status).toBe(303)
+    expect(login.headers.getSetCookie()[0]).toContain('gw_session=')
+  })
+
+  it('rejects a username, password, or confirmation the form cannot accept', async () => {
+    const cases: readonly (readonly [Record<string, string>, RegExp])[] = [
+      [{ username: 'Alice', password: SETUP_PASSWORD, confirm: SETUP_PASSWORD }, /lowercase letters/u],
+      [{ username: 'alice', password: 'short', confirm: 'short' }, /at least 12 characters/u],
+      [{ username: 'alice', password: SETUP_PASSWORD, confirm: 'something-else' }, /do not match/u],
+    ]
+    for (const [body, expected] of cases) {
+      const response = await createAccount(body)
+      expect(response.status).toBe(400)
+      expect(await response.text()).toMatch(expected)
+    }
+    expect(credentials.records.size).toBe(0)
+    expect(setupGateway.configured).toBe(false)
+  })
+
+  it('refuses a cross-site setup post', async () => {
+    const response = await fetch(`${setupBase}/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', origin: 'https://evil.example' },
+      body: new URLSearchParams({ username: 'alice', password: SETUP_PASSWORD, confirm: SETUP_PASSWORD }),
+      redirect: 'manual',
+    })
+    expect(response.status).toBe(403)
+    expect(credentials.records.size).toBe(0)
+  })
+
+  it('refuses an unauthenticated upgrade while unconfigured', async () => {
+    const { status, socket } = await upgrade('/api/remote.mux', undefined, setupBase)
+    expect(status).toBe(503)
     socket.destroy()
   })
 })

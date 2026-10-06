@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { escapeHtml, renderLoginPage, renderNoticePage } from '../src/login-page.ts'
+import { escapeHtml, renderEnrollmentPage, renderLoginPage, renderNoticePage, renderSetupPage, renderUnconfiguredPage } from '../src/login-page.ts'
 
 describe('escapeHtml', () => {
   it('escapes every markup-significant character', () => {
@@ -72,5 +72,66 @@ describe('renderNoticePage', () => {
   it('renders without a link when no login path is given', () => {
     const html = renderNoticePage({ issuer: 'Harness', title: 'No', message: 'Nope' })
     expect(html).not.toContain('<a href=')
+  })
+})
+
+describe('renderSetupPage', () => {
+  it('renders the three setup fields with the stated minimum', () => {
+    const html = renderSetupPage({ issuer: 'Harness', loginPath: '/login', minPasswordLength: 12 })
+    expect(html).toContain('action="/login"')
+    expect(html).toContain('name="username"')
+    expect(html).toContain('name="password"')
+    expect(html).toContain('name="confirm"')
+    expect(html).toContain('minlength="12"')
+    expect(html).toContain('pattern="[a-z][a-z0-9-]{1,31}"')
+    expect(html).toContain('at least 12 characters')
+  })
+
+  it('escapes the error and the prefilled username', () => {
+    const html = renderSetupPage({
+      issuer: 'Harness',
+      loginPath: '/login',
+      minPasswordLength: 12,
+      username: '"><script>alert(1)</script>',
+      error: '<b>nope</b>',
+    })
+    expect(html).not.toContain('<script>alert(1)</script>')
+    expect(html).not.toContain('<b>nope</b>')
+    expect(html).toContain('banner error')
+  })
+})
+
+describe('renderEnrollmentPage', () => {
+  it('shows the grouped secret, the URI, and the account', () => {
+    const html = renderEnrollmentPage({
+      issuer: 'Harness',
+      loginPath: '/login',
+      username: 'alice',
+      secret: 'ABCDEFGHIJKLMNOP',
+      uri: 'otpauth://totp/Harness:alice?secret=ABCDEFGHIJKLMNOP&issuer=Harness',
+    })
+    expect(html).toContain('value="ABCD EFGH IJKL MNOP"')
+    expect(html).toContain('otpauth://totp/Harness:alice?secret=ABCDEFGHIJKLMNOP&amp;issuer=Harness')
+    expect(html).toContain('alice')
+    expect(html).toContain('href="/login"')
+  })
+
+  it('escapes a hostile username', () => {
+    const html = renderEnrollmentPage({
+      issuer: 'Harness',
+      loginPath: '/login',
+      username: '<script>x</script>',
+      secret: 'ABCD',
+      uri: 'otpauth://totp/x',
+    })
+    expect(html).not.toContain('<script>x</script>')
+  })
+})
+
+describe('renderUnconfiguredPage', () => {
+  it('points at the setup path', () => {
+    const html = renderUnconfiguredPage({ issuer: 'Harness', loginPath: '/login' })
+    expect(html).toContain('Not configured')
+    expect(html).toContain('href="/login"')
   })
 })

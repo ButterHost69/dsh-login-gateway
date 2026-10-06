@@ -13,11 +13,18 @@
 import { createServer } from 'node:http'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
-import { randomBytes } from 'node:crypto'
+import { randomBytes, timingSafeEqual } from 'node:crypto'
 import type { ResolvedConfig } from './config.ts'
-import { dummyPasswordVerify, verifyPassword } from './password.ts'
-import { verifyTotp } from './totp.ts'
-import { renderLoginPage, renderNoticePage } from './login-page.ts'
+import { dummyPasswordVerify, hashPassword, verifyPassword } from './password.ts'
+import { generateTotpSecret, totpUri, verifyTotp } from './totp.ts'
+import {
+  renderEnrollmentPage,
+  renderLoginPage,
+  renderNoticePage,
+  renderSetupPage,
+  renderUnconfiguredPage,
+} from './login-page.ts'
+import { isCreatableUsername, type UserDirectory } from './user-store.ts'
 import { FailureLimiter } from './rate-limit.ts'
 import { SessionStore } from './session.ts'
 import { AUTH_COOKIE_PREFIX } from './upstream-auth.ts'
@@ -37,6 +44,18 @@ const PRUNE_INTERVAL_MILLISECONDS = 60_000
 
 const CONTENT_TYPE_FORM = 'application/x-www-form-urlencoded'
 
+/** Cookie carrying the one-time setup token from the tokenized URL to the form post. */
+const SETUP_COOKIE = 'dsh_login_setup'
+
+/** Lifetime of the setup cookie, in seconds. */
+const SETUP_COOKIE_MAX_AGE_SECONDS = 600
+
+/** Shortest password accepted for an account created through setup. */
+const MIN_SETUP_PASSWORD_LENGTH = 12
+
+/** Setup token length in bytes. */
+const SETUP_TOKEN_BYTES = 32
+
 /** Where the gateway reports lifecycle messages. */
 export interface LoginGatewayLogger {
   /** A normal lifecycle message. */
@@ -52,6 +71,8 @@ export interface LoginGatewayDeps {
    * @param authority - the browser-facing `host[:port]`.
    */
   upstreamCookie(authority: string): Promise<string | undefined>
+  /** Configured and stored login accounts. */
+  users: UserDirectory
   /** Lifecycle sink. */
   logger: LoginGatewayLogger
   /** Clock, injectable for tests. */
@@ -64,7 +85,11 @@ export interface LoginGateway {
   readonly port: number
   /** A URL an operator can open, on loopback even for an all-interfaces bind. */
   readonly url: string
-  /** Bind the listener; rejects when the port cannot be taken. */
+  /** Whether any account exists; false means first-run setup is being served. */
+  readonly configured: boolean
+  /** One-time token authorizing setup from a peer that is not loopback. */
+  readonly setupToken: string
+  /** Bind the listener and resolve whether any account exists. */
   start(): Promise<void>
   /** Stop the listener and drop every live connection. */
   stop(): Promise<void>
@@ -116,6 +141,20 @@ function clientAddress(req: IncomingMessage, trustProxy: boolean): string {
     if (forwarded !== undefined) return forwarded
   }
   return req.socket.remoteAddress ?? 'unknown'
+}
+
+/** Constant-time comparison for one-time tokens. */
+function tokenMatches(actual: string | undefined, expected: string): boolean {
+  if (actual === undefined) return false
+  const actualBytes = Buffer.from(actual, 'utf8')
+  const expectedBytes = Buffer.from(expected, 'utf8')
+  return actualBytes.byteLength === expectedBytes.byteLength && timingSafeEqual(actualBytes, expectedBytes)
+}
+
+/** Whether the peer is on loopback, judged from the socket and never from a header. */
+function isLoopbackPeer(req: IncomingMessage): boolean {
+  const address = req.socket.remoteAddress
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
 }
 
 function forwardedProto(req: IncomingMessage): string {
@@ -195,6 +234,8 @@ export function createLoginGateway(config: ResolvedConfig, deps: LoginGatewayDep
   const limiter = new FailureLimiter(config.rateLimit, now)
   const upstream: UpstreamTarget = { host: config.upstreamHost, port: config.upstreamPort }
   const sockets = new Set<Duplex>()
+  const setupToken = randomBytes(SETUP_TOKEN_BYTES).toString('base64url')
+  let configured = false
   let port = config.listenPort
   let pruneTimer: NodeJS.Timeout | undefined
 
@@ -344,7 +385,7 @@ export function createLoginGateway(config: ResolvedConfig, deps: LoginGatewayDep
       }))
       return
     }
-    const user = config.users.find(candidate => candidate.username === username)
+    const user = await deps.users.find(username)
     let accepted = false
     if (user === undefined) {
       // Spend one derivation so an unknown username is not answered faster.
@@ -418,6 +459,137 @@ export function createLoginGateway(config: ResolvedConfig, deps: LoginGatewayDep
     })
   }
 
+  /** Whether this request may read or complete first-run setup. */
+  const setupAuthorized = (req: IncomingMessage): boolean => {
+    if (isLoopbackPeer(req)) return true
+    return tokenMatches(cookieValue(req.headers.cookie, SETUP_COOKIE), setupToken)
+  }
+
+  const setupCookie = (req: IncomingMessage): string => {
+    const parts = [
+      `${SETUP_COOKIE}=${setupToken}`,
+      'Path=/',
+      'HttpOnly',
+      'SameSite=Lax',
+      `Max-Age=${String(SETUP_COOKIE_MAX_AGE_SECONDS)}`,
+    ]
+    if (secureCookie(req)) parts.push('Secure')
+    return parts.join('; ')
+  }
+
+  /**
+   * Refuse first-run setup to a peer that neither is loopback nor presented the
+   * one-time token. Without this, the first internet visitor would own the
+   * deployment.
+   */
+  const refuseSetup = (res: ServerResponse): void => {
+    sendHtml(res, 403, renderNoticePage({
+      issuer: config.issuer,
+      title: 'Setup is local-only',
+      message: 'This deployment has no account yet. Open the sign-in URL on the machine running the harness, '
+        + 'or use the one-time setup link printed at startup to continue through the tunnel.',
+      tone: 'error',
+    }), false)
+  }
+
+  const handleSetup = async (req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> => {
+    const presentedToken = url.searchParams.get('setup')
+    if (presentedToken !== null) {
+      if (!tokenMatches(presentedToken, setupToken)) {
+        refuseSetup(res)
+        return
+      }
+      // Exchange the token for a short-lived cookie so the form post carries it
+      // without keeping the token in the address bar.
+      redirect(res, config.loginPath, { 'set-cookie': setupCookie(req) })
+      return
+    }
+    if (!setupAuthorized(req)) {
+      refuseSetup(res)
+      return
+    }
+    if (req.method === 'GET' || req.method === 'HEAD') {
+      sendHtml(res, 200, renderSetupPage({
+        issuer: config.issuer,
+        loginPath: config.loginPath,
+        minPasswordLength: MIN_SETUP_PASSWORD_LENGTH,
+      }), req.method === 'HEAD')
+      return
+    }
+    if (req.method !== 'POST') {
+      res.writeHead(405, { allow: 'GET, HEAD, POST', 'cache-control': 'no-store' })
+      res.end()
+      return
+    }
+    if (!isSameOrigin(req)) {
+      notice(res, 403, 'Request refused', 'The setup request did not come from this site.')
+      return
+    }
+    const contentType = headerValue(req.headers, 'content-type') ?? ''
+    if (!contentType.toLowerCase().startsWith(CONTENT_TYPE_FORM)) {
+      sendText(res, 415, 'expected application/x-www-form-urlencoded\n', { connection: 'close' })
+      return
+    }
+    let body: string
+    try {
+      body = await readBody(req, MAX_LOGIN_BODY_BYTES)
+    } catch (error) {
+      if (error instanceof BodyTooLargeError) {
+        sendText(res, 413, 'setup form too large\n', { connection: 'close' })
+        return
+      }
+      throw error
+    }
+    const form = new URLSearchParams(body)
+    const username = (form.get('username') ?? '').trim().slice(0, 64)
+    const password = (form.get('password') ?? '').slice(0, 4096)
+    const confirm = (form.get('confirm') ?? '').slice(0, 4096)
+    const reject = (message: string, status = 400): void => {
+      sendHtml(res, status, renderSetupPage({
+        issuer: config.issuer,
+        loginPath: config.loginPath,
+        error: message,
+        username,
+        minPasswordLength: MIN_SETUP_PASSWORD_LENGTH,
+      }), false)
+    }
+    if (!isCreatableUsername(username)) {
+      reject('Username must be 2-32 characters of lowercase letters, digits, and hyphens, starting with a letter.')
+      return
+    }
+    if (password.length < MIN_SETUP_PASSWORD_LENGTH) {
+      reject(`Password must be at least ${String(MIN_SETUP_PASSWORD_LENGTH)} characters.`)
+      return
+    }
+    if (password !== confirm) {
+      reject('The passwords do not match.')
+      return
+    }
+    const totpSecret = generateTotpSecret()
+    const passwordHash = await hashPassword(password)
+    try {
+      await deps.users.create({ username, passwordHash, totpSecret })
+    } catch (error) {
+      reject(error instanceof Error ? error.message : 'The account could not be created.', 409)
+      return
+    }
+    configured = true
+    sendHtml(res, 200, renderEnrollmentPage({
+      issuer: config.issuer,
+      loginPath: config.loginPath,
+      username,
+      secret: totpSecret,
+      uri: totpUri({
+        secret: totpSecret,
+        account: username,
+        issuer: config.issuer,
+        digits: config.totp.digits,
+        periodSeconds: config.totp.periodSeconds,
+        algorithm: config.totp.algorithm,
+      }),
+    }), false)
+  }
+
   const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     let url: URL
     try {
@@ -433,6 +605,28 @@ export function createLoginGateway(config: ResolvedConfig, deps: LoginGatewayDep
     if (url.pathname === '/favicon.ico') {
       res.writeHead(204, { 'cache-control': 'no-store' })
       res.end()
+      return
+    }
+    if (!configured) {
+      if (url.pathname === config.loginPath) {
+        await handleSetup(req, res, url)
+        return
+      }
+      // Nothing else is served before the first account exists: the harness is
+      // not reachable through an unconfigured gateway.
+      if (wantsHtml(req)) {
+        sendHtml(res, 503, renderUnconfiguredPage({
+          issuer: config.issuer,
+          loginPath: config.loginPath,
+        }), false)
+        return
+      }
+      res.writeHead(503, {
+        'cache-control': 'no-store',
+        'content-type': 'application/json; charset=utf-8',
+        'retry-after': '30',
+      })
+      res.end(JSON.stringify({ error: 'not-configured' }))
       return
     }
     if (url.pathname === config.loginPath) {
@@ -461,6 +655,11 @@ export function createLoginGateway(config: ResolvedConfig, deps: LoginGatewayDep
 
   const handleUpgrade = async (req: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> => {
     const url = new URL(req.url ?? '/', 'http://gateway.invalid')
+    if (!configured) {
+      socket.write('HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-length: 0\r\n\r\n')
+      socket.destroy()
+      return
+    }
     if (url.pathname === config.loginPath || url.pathname === config.logoutPath || url.pathname === HEALTH_PATH) {
       socket.write('HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n')
       socket.destroy()
@@ -515,7 +714,14 @@ export function createLoginGateway(config: ResolvedConfig, deps: LoginGatewayDep
       const host = config.listenHost === '0.0.0.0' ? '127.0.0.1' : config.listenHost
       return `http://${host}:${String(port)}`
     },
+    get configured(): boolean {
+      return configured
+    },
+    get setupToken(): string {
+      return setupToken
+    },
     async start(): Promise<void> {
+      configured = !(await deps.users.isEmpty())
       await new Promise<void>((resolve, reject) => {
         const onError = (error: Error): void => { reject(error) }
         server.once('error', onError)

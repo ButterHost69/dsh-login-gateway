@@ -24,13 +24,14 @@ This plugin adds a real login — the kind you can hand to a person or keep in a
 - Verifies the username, a scrypt-hashed password, and a TOTP code, then issues its own HMAC-signed session cookie.
 - Forwards every other request and WebSocket upgrade to the running harness, preserving the browser-facing `Host`.
 - Performs the harness's own launch-token → cookie exchange **server-side**, so neither the launch token nor the harness's cookie ever reaches the browser.
+- Asks for the first username and password when none is configured, generating the TOTP secret and storing the account as a credential record.
 - Throttles failed sign-ins per client address and per username.
 
 ## Requirements
 
 - `dsh` `0.2.1-alpha.1` (verified) or a compatible release.
 - Node.js `^22.19 || >=24`.
-- A Web profile (`dsh web`).
+- A Web profile (`dsh web`), which mounts the credential store first-run setup writes to.
 
 ## Install
 
@@ -55,18 +56,29 @@ From a local checkout:
 dsh plugin --profile web add -w /absolute/path/to/dsh-login-gateway
 ```
 
-Installing selects the bundle, which inserts the plugin row. The row starts with no users, so the plugin **refuses to activate** until it is configured:
+Installing selects the bundle, which inserts the plugin row. The row starts with no users, so the plugin comes up in **first-run setup**: it serves a form that asks for the first username and password, generates the TOTP secret, and stores the account in the harness credential store.
 
 ```
-dsh: warning: 1 entry did not activate
-login-gateway (dsh-login-gateway): Error: dsh-login-gateway: config.users is empty; add at least one user ...
+dsh-login-gateway: set up at http://127.0.0.1:8080/login (forwarding to http://127.0.0.1:3080)
+dsh-login-gateway: no account exists yet; open that URL on this machine, or use http://127.0.0.1:8080/login?setup=… once to set one up through a tunnel
 ```
 
-The harness itself keeps running on its own port, so you can always reach it directly to fix the configuration.
+## First run
 
-## Configure
+Open the printed URL. On the machine running the harness, `http://127.0.0.1:8080/login` is enough. Through a tunnel, open the `?setup=…` URL once: the token is minted per process and is the only thing that lets a non-loopback peer create the first account.
 
-Create a user. The script hashes the password with scrypt and mints a fresh base32 TOTP secret:
+The setup form asks for a username, a password, and its confirmation:
+
+- The username becomes the credential-record id, so it is 2–32 characters of lowercase letters, digits, and hyphens, starting with a letter.
+- The password must be at least 12 characters.
+
+Submitting creates the account and shows the **enrollment page once**: a base32 secret and an `otpauth://` URI. Add it to Google Authenticator, 1Password, Aegis, or any other TOTP app, then sign in with a code to confirm enrollment. The secret is not shown again — the server keeps it to verify codes, but there is no page that reveals it later.
+
+While no account exists, every other path answers `503` and the harness is not reachable through the gateway. Only the first account can be created this way; add further accounts declaratively, below.
+
+## Configure accounts in the profile
+
+For a reproducible deployment, or to add accounts after the first, declare users in configuration. The script hashes the password with scrypt and mints a fresh base32 TOTP secret:
 
 ```sh
 cd /path/to/dsh-login-gateway
@@ -88,7 +100,7 @@ It prints a ready-to-paste block and an `otpauth://` URI. Paste the block into `
         totpSecret: 'NOVJ3ZLTORZGK6LQ…'
 ```
 
-Add the `otpauth://` URI to Google Authenticator, 1Password, Aegis, or any other TOTP app. Then restart `dsh web` (or let HMR reload the profile). The startup output names the sign-in URL:
+Configured users always win over a stored record with the same name. Add the `otpauth://` URI to your authenticator app, then restart `dsh web` (or let HMR reload the profile). The startup output names the sign-in URL:
 
 ```
 dsh-login-gateway: sign in at http://127.0.0.1:8080/login (forwarding to http://127.0.0.1:3080)
@@ -122,7 +134,7 @@ harness.example.com {
 
 ## Configuration reference
 
-Every field is optional except `users`, and every value has a default:
+Every field is optional, and every value has a default:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -130,9 +142,9 @@ Every field is optional except `users`, and every value has a default:
 | `listenPort` | `8080` | Gateway port. `0` asks the OS for a free port. |
 | `upstreamHost` | `'127.0.0.1'` | The harness web server's host. |
 | `upstreamPort` | the running web server's port | Override only when the harness listens somewhere the plugin cannot read. |
-| `loginPath` | `'/login'` | Login form path. |
+| `loginPath` | `'/login'` | Login form path, and the setup form while no account exists. |
 | `logoutPath` | `'/logout'` | Sign-out path. |
-| `users` | `[]` | Required. Each entry is `{ username, passwordHash, totpSecret }`. |
+| `users` | `[]` | Declared accounts, each `{ username, passwordHash, totpSecret }`. An empty list means first-run setup. |
 | `branding.issuer` | `'DeepSeek Harness'` | Product name on the login page. |
 | `totp.digits` | `6` | Code length (`6` or `8`). |
 | `totp.periodSeconds` | `30` | Seconds per time step. |
@@ -148,11 +160,12 @@ Every field is optional except `users`, and every value has a default:
 
 ## Security notes
 
-- **Passwords** are stored as scrypt hashes (`N=16384, r=8, p=1`, 16-byte salt, 32-byte key) and compared in constant time. The enrollment script never stores the plaintext.
+- **Passwords** are stored as scrypt hashes (`N=16384, r=8, p=1`, 16-byte salt, 32-byte key) and compared in constant time. Neither the enrollment script nor the setup form keeps the plaintext.
 - **TOTP** follows RFC 6238 with the authenticator-app defaults and a ±1 step window, compared without an early exit.
+- **First-run setup is local-only.** Only a loopback peer, or a peer holding the per-process setup token printed at startup, may read the setup form or create the first account. Every other request is refused with `503` until an account exists, so an exposed port is never briefly open. The token is exchanged for a short-lived cookie so it does not stay in the address bar.
 - **Sessions** are random 256-bit ids in process memory, carried by an HMAC-SHA256 cookie (`HttpOnly`, `SameSite=Lax`, `Path=/`, `Secure` over HTTPS). A restart signs everyone out, and there is no persistent session store to steal. `SameSite=Lax` keeps a shared link working from another site; sign-out requires a same-origin request so no other page can end the session.
 - **Brute force** is throttled per client address and per submitted username. An unknown username still spends one password derivation, so it is not answered faster than a wrong password.
-- **Sign-in POSTs** must be same-origin (`Origin`/`Sec-Fetch-Site`), and the login page ships under `default-src 'none'` with no scripts or third-party resources.
+- **Sign-in and setup POSTs** must be same-origin (`Origin`/`Sec-Fetch-Site`), and both pages ship under `default-src 'none'` with no scripts or third-party resources.
 - **The harness credentials stay server-side.** The plugin exchanges the launch token for the harness cookie inside its own process and attaches that cookie to forwarded requests; the browser only ever holds the gateway's session cookie. A browser-supplied `dsh-auth-*` cookie is stripped.
 - **Not an open proxy.** The gateway forwards only to its configured upstream.
 
@@ -160,29 +173,31 @@ What it deliberately does **not** do:
 
 - **TLS.** Terminate it at the tunnel or reverse proxy.
 - **Multi-user authorization.** Every authenticated browser speaks for the harness's single operator Peer, so this is a single-operator gate, not a multi-tenant one.
-- **Persistent accounts, audit log, or recovery codes.** Users live in configuration; losing the authenticator means generating a new secret.
+- **Account management after setup.** Only the first account can be created in the browser; later accounts are declared in configuration. There is no password reset, audit log, or recovery code — losing the authenticator means generating a new secret.
 - **Protecting the harness port itself.** If `dsh web` is also bound to a public interface, that path is unaffected. Keep it on loopback and expose only the gateway.
 
 ## Limitations
 
 - One upstream and no path rewriting. The harness serves origin-root routes; if your proxy mounts a prefix, configure `--public-url` on `dsh` and strip the prefix at the proxy — the gateway forwards paths unchanged.
-- Sessions and throttling live in memory and are lost on restart.
-- The login page is English-only.
+- Sessions and throttling live in memory and are lost on restart; accounts do not, because setup writes them to the credential store.
+- The login, setup, and enrollment pages are English-only.
 
 ## How it works
 
 | File | Responsibility |
 | --- | --- |
-| `src/index.ts` | Cordis plugin: reads the harness port, builds the upstream cookie provider, starts and stops the gateway with the fiber. |
-| `src/gateway.ts` | The gateway module: routing, sign-in, sign-out, throttling, session handling, and forwarding. |
+| `src/index.ts` | Cordis plugin: reads the harness port, builds the user directory and upstream cookie provider, starts and stops the gateway with the fiber. |
+| `src/gateway.ts` | The gateway module: routing, first-run setup, sign-in, sign-out, throttling, session handling, and forwarding. |
 | `src/proxy.ts` | HTTP/1.1 and WebSocket reverse proxy: hop-by-hop filtering, streaming bodies, upgrade tunneling. |
 | `src/upstream-auth.ts` | Mints and caches the harness's cookie per browser authority via `ctx.connection.authenticatedUrl`. |
+| `src/user-store.ts` | Merges configured users with credential records, and writes the account first-run setup creates. |
 | `src/session.ts` | In-memory sessions and signed cookie values. |
 | `src/password.ts` | scrypt hashing, parsing, and constant-time verification. |
 | `src/totp.ts`, `src/base32.ts` | RFC 6238 TOTP and RFC 4648 base32. |
 | `src/rate-limit.ts` | Sliding-window failure throttling. |
 | `src/login-page.ts` | Server-rendered HTML with inline CSS. |
 | `src/config.ts` | Config schema and load-time validation. |
+| `src/types.ts` | The narrow Host service contracts this plugin consumes. |
 
 ## Development
 
@@ -193,7 +208,7 @@ pnpm test            # vitest: crypto units and a real-socket integration suite
 pnpm run typecheck
 ```
 
-The integration suite starts a stand-in harness (token exchange, authenticated routes, and a WebSocket upgrade) and drives the gateway over real sockets: unauthenticated redirects, the full sign-in flow, cookie stripping, streaming responses, 502 handling, throttling, and upgrade tunneling.
+The integration suite starts a stand-in harness (token exchange, authenticated routes, and a WebSocket upgrade) and drives the gateway over real sockets: unauthenticated redirects, first-run setup and enrollment, the full sign-in flow, cookie stripping, streaming responses, 502 handling, throttling, and upgrade tunneling.
 
 ## License
 

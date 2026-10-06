@@ -77,7 +77,11 @@ export interface LoginGatewayConfig {
   loginPath?: string
   /** Path clearing the session. */
   logoutPath?: string
-  /** Login accounts; at least one is required. */
+  /**
+   * Login accounts declared in configuration. An empty list is allowed: the
+   * gateway then serves first-run setup, which stores the account it creates
+   * as a credential record.
+   */
   users?: UserConfig[]
   /** Product name shown on the login page. */
   branding?: BrandingConfig
@@ -163,12 +167,6 @@ function assertPath(value: string, field: string): string {
 }
 
 function resolveUsers(users: readonly UserConfig[]): readonly UserConfig[] {
-  if (users.length === 0) {
-    throw new Error(
-      'dsh-login-gateway: config.users is empty; add at least one user (see the README enrollment section) '
-      + 'or remove the plugin. The gateway refuses to start open.',
-    )
-  }
   const seen = new Set<string>()
   return users.map((user) => {
     const username = user.username.trim()

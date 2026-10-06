@@ -40,6 +40,42 @@ export interface NoticePageOptions {
   readonly tone?: 'info' | 'error' | undefined
 }
 
+/** Inputs for the first-run setup form. */
+export interface SetupPageOptions {
+  /** Product name shown in the title and heading. */
+  readonly issuer: string
+  /** Form action path. */
+  readonly loginPath: string
+  /** Error banner text. */
+  readonly error?: string | undefined
+  /** Value to prefill in the username field. */
+  readonly username?: string | undefined
+  /** Minimum accepted password length, stated on the form. */
+  readonly minPasswordLength: number
+}
+
+/** Inputs for the enrollment page shown once, right after setup. */
+export interface EnrollmentPageOptions {
+  /** Product name shown in the title and heading. */
+  readonly issuer: string
+  /** Sign-in path the user continues to. */
+  readonly loginPath: string
+  /** The account that was just created. */
+  readonly username: string
+  /** Base32 TOTP secret to enter in the authenticator app. */
+  readonly secret: string
+  /** `otpauth://` enrollment URI. */
+  readonly uri: string
+}
+
+/** Inputs for the refusal shown on every other path while no account exists. */
+export interface UnconfiguredPageOptions {
+  /** Product name shown in the title and heading. */
+  readonly issuer: string
+  /** Path that serves the setup form. */
+  readonly loginPath: string
+}
+
 /**
  * Escape text for an HTML text or quoted-attribute position.
  * @param value - untrusted text.
@@ -152,5 +188,74 @@ export function renderNoticePage(options: NoticePageOptions): string {
     body: `<h1>${escapeHtml(options.title)}</h1>
 <p class="banner ${options.tone === 'error' ? 'error' : 'notice'}" role="alert">${escapeHtml(options.message)}</p>
 ${link}`,
+  })
+}
+
+/**
+ * Render the first-run setup form, shown while no account exists.
+ * @param options - branding, form target, and banners.
+ * @returns the complete HTML document.
+ */
+export function renderSetupPage(options: SetupPageOptions): string {
+  const banner = options.error === undefined
+    ? ''
+    : `<p class="banner error" role="alert">${escapeHtml(options.error)}</p>`
+  const username = options.username === undefined ? '' : escapeHtml(options.username)
+  return documentShell({
+    issuer: options.issuer,
+    title: `Set up ${options.issuer}`,
+    body: `<h1>Create the first account</h1>
+<p class="sub">No account exists yet, so this deployment is not serving the harness. Create one to continue; it is stored in the harness credential store.</p>
+${banner}<form method="post" action="${escapeHtml(options.loginPath)}" autocomplete="on">
+<label for="username">Username</label>
+<input id="username" name="username" type="text" autocomplete="username" autocapitalize="none"
+ spellcheck="false" required autofocus value="${username}" pattern="[a-z][a-z0-9-]{1,31}">
+<label for="password">Password</label>
+<input id="password" name="password" type="password" autocomplete="new-password"
+ minlength="${options.minPasswordLength}" required>
+<label for="confirm">Confirm password</label>
+<input id="confirm" name="confirm" type="password" autocomplete="new-password"
+ minlength="${options.minPasswordLength}" required>
+<button type="submit">Create account</button>
+</form>
+<footer>Lowercase letters, digits, and hyphens; at least ${options.minPasswordLength} characters.</footer>`,
+  })
+}
+
+/**
+ * Render the one-time enrollment page: the secret to enter in an authenticator
+ * app, shown immediately after setup creates the account.
+ * @param options - the account, its secret, and its enrollment URI.
+ * @returns the complete HTML document.
+ */
+export function renderEnrollmentPage(options: EnrollmentPageOptions): string {
+  const grouped = options.secret.replace(/(.{4})/gu, '$1 ').trim()
+  return documentShell({
+    issuer: options.issuer,
+    title: `Enroll ${options.username} - ${options.issuer}`,
+    body: `<h1>Add the authenticator</h1>
+<p class="sub">Enter this secret in your authenticator app now. It is shown once and cannot be recovered from the server.</p>
+<label for="secret">Secret</label>
+<input id="secret" type="text" value="${escapeHtml(grouped)}" readonly onfocus="this.select()">
+<label for="uri">Enrollment URI</label>
+<input id="uri" type="text" value="${escapeHtml(options.uri)}" readonly onfocus="this.select()">
+<p class="banner notice">Account <strong>${escapeHtml(options.username)}</strong> created. Sign in with a code from the app to confirm enrollment.</p>
+<p class="sub"><a href="${escapeHtml(options.loginPath)}">Continue to sign in</a></p>`,
+  })
+}
+
+/**
+ * Render the refusal shown on every path except the setup form while no
+ * account exists.
+ * @param options - branding and the setup path.
+ * @returns the complete HTML document.
+ */
+export function renderUnconfiguredPage(options: UnconfiguredPageOptions): string {
+  return documentShell({
+    issuer: options.issuer,
+    title: `Not configured - ${options.issuer}`,
+    body: `<h1>Not configured</h1>
+<p class="banner notice" role="alert">This deployment has no account yet, so it is not serving the harness. Create the first account at <code>${escapeHtml(options.loginPath)}</code> to continue.</p>
+<p class="sub"><a href="${escapeHtml(options.loginPath)}">Set up the first account</a></p>`,
   })
 }

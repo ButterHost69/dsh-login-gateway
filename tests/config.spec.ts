@@ -48,8 +48,8 @@ describe('resolveConfig', () => {
     expect(resolved.upstreamPort).toBe(9999)
   })
 
-  it('refuses to start with no users', () => {
-    expect(() => resolveConfig({}, 3080)).toThrow(/config\.users is empty/u)
+  it('allows an empty user list, which puts the gateway in setup mode', () => {
+    expect(resolveConfig({}, 3080).users).toEqual([])
   })
 
   it('refuses duplicate usernames regardless of case', async () => {
