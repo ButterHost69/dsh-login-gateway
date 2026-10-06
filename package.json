@@ -1,0 +1,85 @@
+{
+  "name": "dsh-login-gateway",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness (dsh) plugin: a username, password and TOTP login front door for the Web UI, for tunneled or public deployments.",
+  "license": "MIT",
+  "author": "ButterHost69",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ButterHost69/dsh-login-gateway.git"
+  },
+  "homepage": "https://github.com/ButterHost69/dsh-login-gateway#readme",
+  "bugs": "https://github.com/ButterHost69/dsh-login-gateway/issues",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "deepseek",
+    "login",
+    "authentication",
+    "totp",
+    "otp",
+    "2fa",
+    "reverse-proxy",
+    "tunnel"
+  ],
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./password": {
+      "types": "./lib/types/password.d.ts",
+      "default": "./lib/password.js"
+    },
+    "./totp": {
+      "types": "./lib/types/totp.d.ts",
+      "default": "./lib/totp.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/**/*.js",
+    "lib/**/*.d.ts",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": "^22.19 || >=24"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "scripts": {
+    "build": "tsc && tsdown",
+    "prepare": "tsc && tsdown",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "enroll": "node scripts/enroll.mjs"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.4"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@types/node": "^22.10.0",
+    "tsdown": "0.22.2",
+    "typescript": "~5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

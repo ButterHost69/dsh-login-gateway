@@ -1,0 +1,22 @@
+# dsh-login-gateway bundle patch.
+#
+# Selects this plugin for the profile that installs it and inserts its row.
+# The row starts unconfigured on purpose: with no users the plugin refuses to
+# load, so an installation is never briefly open. Configure it, then restart
+# `dsh web` (or let HMR reload the profile).
+#
+#   dsh plugin --profile web add -w github:ButterHost69/dsh-login-gateway
+#
+# Then replace the empty config below with your own users. `npm run enroll`
+# in this repository prints a ready-to-paste user block.
+- insert:
+    - id: login-gateway
+      name: 'dsh-login-gateway'
+      config:
+        # Public listener the tunnel or reverse proxy forwards to. Loopback
+        # keeps the plain-HTTP leg off the network; the tunnel reaches it.
+        listenHost: '127.0.0.1'
+        listenPort: 8080
+        # Users are required. Each one needs a scrypt hash and a base32 TOTP
+        # secret; `npm run enroll` generates both.
+        users: []
