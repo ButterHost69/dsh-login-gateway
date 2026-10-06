@@ -209,7 +209,10 @@ export function createLoginGateway(config: ResolvedConfig, deps: LoginGatewayDep
       `${config.session.cookieName}=${value}`,
       'Path=/',
       'HttpOnly',
-      'SameSite=Strict',
+      // Lax, not Strict: a link to the deployment from another site must land
+      // in the application rather than bounce to the login form. Sign-out and
+      // the sign-in POST each require a same-origin request instead.
+      'SameSite=Lax',
       `Max-Age=${String(maxAgeSeconds)}`,
       `Expires=${new Date(expiresAt).toUTCString()}`,
     ]
@@ -222,7 +225,7 @@ export function createLoginGateway(config: ResolvedConfig, deps: LoginGatewayDep
       `${config.session.cookieName}=`,
       'Path=/',
       'HttpOnly',
-      'SameSite=Strict',
+      'SameSite=Lax',
       'Max-Age=0',
       'Expires=Thu, 01 Jan 1970 00:00:00 GMT',
     ]
@@ -381,6 +384,12 @@ export function createLoginGateway(config: ResolvedConfig, deps: LoginGatewayDep
     if (req.method !== 'GET' && req.method !== 'POST') {
       res.writeHead(405, { allow: 'GET, POST', 'cache-control': 'no-store' })
       res.end()
+      return
+    }
+    // A Lax cookie travels on a cross-site top-level navigation, so sign-out
+    // itself has to refuse one; otherwise any page could end the session.
+    if (!isSameOrigin(req)) {
+      notice(res, 403, 'Request refused', 'The sign-out request did not come from this site.')
       return
     }
     sessions.delete(cookieValue(req.headers.cookie, config.session.cookieName))

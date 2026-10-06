@@ -150,7 +150,7 @@ Every field is optional except `users`, and every value has a default:
 
 - **Passwords** are stored as scrypt hashes (`N=16384, r=8, p=1`, 16-byte salt, 32-byte key) and compared in constant time. The enrollment script never stores the plaintext.
 - **TOTP** follows RFC 6238 with the authenticator-app defaults and a ±1 step window, compared without an early exit.
-- **Sessions** are random 256-bit ids in process memory, carried by an HMAC-SHA256 cookie (`HttpOnly`, `SameSite=Strict`, `Path=/`, `Secure` over HTTPS). A restart signs everyone out, and there is no persistent session store to steal.
+- **Sessions** are random 256-bit ids in process memory, carried by an HMAC-SHA256 cookie (`HttpOnly`, `SameSite=Lax`, `Path=/`, `Secure` over HTTPS). A restart signs everyone out, and there is no persistent session store to steal. `SameSite=Lax` keeps a shared link working from another site; sign-out requires a same-origin request so no other page can end the session.
 - **Brute force** is throttled per client address and per submitted username. An unknown username still spends one password derivation, so it is not answered faster than a wrong password.
 - **Sign-in POSTs** must be same-origin (`Origin`/`Sec-Fetch-Site`), and the login page ships under `default-src 'none'` with no scripts or third-party resources.
 - **The harness credentials stay server-side.** The plugin exchanges the launch token for the harness cookie inside its own process and attaches that cookie to forwarded requests; the browser only ever holds the gateway's session cookie. A browser-supplied `dsh-auth-*` cookie is stripped.

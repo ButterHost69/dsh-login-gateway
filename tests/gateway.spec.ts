@@ -161,6 +161,7 @@ describe('sign-in', () => {
     expect(response.headers.get('location')).toBe('/')
     const cookie = sessionCookie(response)
     expect(cookie).toMatch(/^gw_session=/u)
+    expect(response.headers.getSetCookie()[0]).toContain('SameSite=Lax')
   })
 
   it('refuses a wrong password, a wrong code, and an unknown user', async () => {
@@ -222,6 +223,17 @@ describe('sign-in', () => {
     const locked = await login()
     expect(locked.status).toBe(429)
     expect(Number(locked.headers.get('retry-after'))).toBeGreaterThan(0)
+  })
+
+  it('refuses a cross-site sign-out', async () => {
+    const cookie = sessionCookie(await login())
+    const refused = await fetch(`${base}/logout`, {
+      redirect: 'manual',
+      headers: { cookie, origin: 'https://evil.example' },
+    })
+    expect(refused.status).toBe(403)
+    const stillIn = await fetch(`${base}/api/echo`, { headers: { cookie } })
+    expect(stillIn.status).toBe(200)
   })
 
   it('signs out and invalidates the session', async () => {
