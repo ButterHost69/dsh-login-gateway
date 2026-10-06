@@ -124,6 +124,8 @@ The proxy must:
 - **Set `X-Forwarded-For`** (Cloudflare Tunnel and Caddy do this by default) and set `trustProxy: true`. Without it every request looks like it came from the proxy, so one attacker's failed attempts throttle everyone.
 - **Terminate TLS.** The gateway speaks plain HTTP, exactly like the harness.
 
+> **A tunnel that rewrites `Host` breaks the harness API, not just this gateway.** The gateway tolerates it — it checks the browser's Fetch Metadata, so its own setup and sign-in pages work either way — but `dsh`'s `/api` fence compares the browser's `Origin` against the received `Host`. If the tunnel forwards `Host: 127.0.0.1:8080`, every API call gets `403`. For a Cloudflare dashboard-managed tunnel, edit the public hostname, open **Additional application settings → HTTP Settings**, and set **HTTP Host Header** to that hostname; then start `dsh web --trusted-host <hostname>`, because the authority is no longer loopback. Caddy and most config-file proxies already preserve `Host`.
+
 For Cloudflare Tunnel, the origin service is simply `http://127.0.0.1:8080`. For a Caddy front end:
 
 ```
@@ -165,7 +167,8 @@ Every field is optional, and every value has a default:
 - **First-run setup is local-only.** Only a loopback peer, or a peer holding the per-process setup token printed at startup, may read the setup form or create the first account. Every other request is refused with `503` until an account exists, so an exposed port is never briefly open. The token is exchanged for a short-lived cookie so it does not stay in the address bar.
 - **Sessions** are random 256-bit ids in process memory, carried by an HMAC-SHA256 cookie (`HttpOnly`, `SameSite=Lax`, `Path=/`, `Secure` over HTTPS). A restart signs everyone out, and there is no persistent session store to steal. `SameSite=Lax` keeps a shared link working from another site; sign-out requires a same-origin request so no other page can end the session.
 - **Brute force** is throttled per client address and per submitted username. An unknown username still spends one password derivation, so it is not answered faster than a wrong password.
-- **Sign-in and setup POSTs** must be same-origin (`Origin`/`Sec-Fetch-Site`), and both pages ship under `default-src 'none'` with no scripts or third-party resources.
+- **Sign-in and setup POSTs** must not be cross-site. The browser's `Sec-Fetch-Site` is authoritative and script cannot set it; without Fetch Metadata, `Origin` is compared against `Host` and the proxy-supplied `X-Forwarded-Host`. Both pages ship under `default-src 'none'` with no scripts or third-party resources.
+- **Losing the last account returns the gateway to setup** rather than locking everyone out: when neither configuration nor the credential store holds a user, the sign-in form becomes the setup form again.
 - **The harness credentials stay server-side.** The plugin exchanges the launch token for the harness cookie inside its own process and attaches that cookie to forwarded requests; the browser only ever holds the gateway's session cookie. A browser-supplied `dsh-auth-*` cookie is stripped.
 - **Not an open proxy.** The gateway forwards only to its configured upstream.
 

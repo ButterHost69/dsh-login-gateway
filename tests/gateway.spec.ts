@@ -1,5 +1,6 @@
 import { connect } from 'node:net'
 import type { Socket } from 'node:net'
+import { request as httpRequest } from 'node:http'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { resolveConfig, type LoginGatewayConfig } from '../src/config.ts'
 import { createLoginGateway, type LoginGateway } from '../src/gateway.ts'
@@ -50,6 +51,36 @@ async function login(options: {
   const headers: Record<string, string> = { 'content-type': 'application/x-www-form-urlencoded' }
   if (options.origin !== null) headers['origin'] = options.origin ?? base
   return await fetch(`${base}/login`, { method: 'POST', body, headers, redirect: 'manual' })
+}
+
+/**
+ * POST with full control over the request headers, which `fetch` forbids for
+ * `Host`. Used to stand in for a tunnel that rewrites it.
+ */
+function postWithHeaders(
+  target: string,
+  path: string,
+  headers: Record<string, string>,
+  body: string,
+): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(target)
+    const request = httpRequest({
+      host: url.hostname,
+      port: url.port,
+      path,
+      method: 'POST',
+      headers: { ...headers, 'content-length': String(Buffer.byteLength(body)) },
+    }, (response) => {
+      const chunks: Buffer[] = []
+      response.on('data', (chunk: Buffer) => { chunks.push(chunk) })
+      response.on('end', () => {
+        resolve({ status: response.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') })
+      })
+    })
+    request.on('error', reject)
+    request.end(body)
+  })
 }
 
 /** Open one WebSocket-shaped upgrade and read its status line and headers. */
@@ -451,6 +482,88 @@ describe('first-run setup', () => {
     })
     expect(response.status).toBe(403)
     expect(credentials.records.size).toBe(0)
+  })
+
+  it('accepts a same-origin post when a proxy rewrote Host', async () => {
+    const response = await postWithHeaders(setupBase, '/login', {
+      // What a tunnel that does not preserve Host sends, while the browser's
+      // own Fetch Metadata still says the request is same-origin.
+      host: '127.0.0.1:9',
+      origin: 'https://harness.example.com',
+      'sec-fetch-site': 'same-origin',
+      'content-type': 'application/x-www-form-urlencoded',
+    }, new URLSearchParams({
+      username: 'proxied',
+      password: SETUP_PASSWORD,
+      confirm: SETUP_PASSWORD,
+    }).toString())
+    expect(response.status).toBe(200)
+    expect(response.body).toContain('Add the authenticator')
+  })
+
+  it('still refuses a cross-site post that claims nothing', async () => {
+    const response = await postWithHeaders(setupBase, '/login', {
+      host: '127.0.0.1:9',
+      origin: 'https://evil.example',
+      'sec-fetch-site': 'cross-site',
+      'content-type': 'application/x-www-form-urlencoded',
+    }, new URLSearchParams({
+      username: 'attacker',
+      password: SETUP_PASSWORD,
+      confirm: SETUP_PASSWORD,
+    }).toString())
+    expect(response.status).toBe(403)
+    expect(credentials.records.size).toBe(0)
+  })
+
+  it('falls back to X-Forwarded-Host without Fetch Metadata', async () => {
+    const response = await postWithHeaders(setupBase, '/login', {
+      host: '127.0.0.1:9',
+      'x-forwarded-host': 'harness.example.com',
+      origin: 'https://harness.example.com',
+      'content-type': 'application/x-www-form-urlencoded',
+    }, new URLSearchParams({
+      username: 'forwarded',
+      password: SETUP_PASSWORD,
+      confirm: SETUP_PASSWORD,
+    }).toString())
+    expect(response.status).toBe(200)
+    expect(response.body).toContain('Add the authenticator')
+  })
+
+  it('returns to setup when the last stored account disappears', async () => {
+    expect((await createAccount({
+      username: 'alice',
+      password: SETUP_PASSWORD,
+      confirm: SETUP_PASSWORD,
+    })).status).toBe(200)
+    expect(setupGateway.configured).toBe(true)
+
+    credentials.records.clear()
+
+    const form = await fetch(`${setupBase}/login`, { headers: { 'sec-fetch-dest': 'document' } })
+    expect(form.status).toBe(200)
+    expect(await form.text()).toContain('Create the first account')
+    expect(setupGateway.configured).toBe(false)
+  })
+
+  it('offers setup when a sign-in finds no account at all', async () => {
+    expect((await createAccount({
+      username: 'alice',
+      password: SETUP_PASSWORD,
+      confirm: SETUP_PASSWORD,
+    })).status).toBe(200)
+    credentials.records.clear()
+
+    const response = await fetch(`${setupBase}/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', origin: setupBase },
+      body: new URLSearchParams({ username: 'alice', password: SETUP_PASSWORD, otp: '000000' }),
+      redirect: 'manual',
+    })
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('Create the first account')
+    expect(setupGateway.configured).toBe(false)
   })
 
   it('refuses an unauthenticated upgrade while unconfigured', async () => {

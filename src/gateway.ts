@@ -179,18 +179,35 @@ function safeNext(value: string | null | undefined): string | undefined {
   return value
 }
 
-/** Reject a cross-site form post; a browser always sends Origin on one. */
+/**
+ * Reject a cross-site form post.
+ *
+ * Browsers label every request with `Sec-Fetch-Site`, which script cannot set,
+ * so a `same-origin` post is accepted without comparing `Origin` to `Host`. A
+ * tunnel or reverse proxy in front may rewrite `Host` — the harness's own
+ * fence requires it to preserve the browser-facing authority, but this
+ * gateway's pages must work either way. Without Fetch Metadata, fall back to
+ * comparing `Origin` against `Host` and the proxy-supplied `X-Forwarded-Host`.
+ */
 function isSameOrigin(req: IncomingMessage): boolean {
-  if (headerValue(req.headers, 'sec-fetch-site') === 'cross-site') return false
+  const site = headerValue(req.headers, 'sec-fetch-site')
+  if (site === 'cross-site') return false
+  if (site === 'same-origin' || site === 'none') return true
   const origin = headerValue(req.headers, 'origin')
   if (origin === undefined) return true
-  const host = headerValue(req.headers, 'host')
-  if (host === undefined) return false
-  try {
-    return new URL(origin).host === new URL(`http://${host}`).host
-  } catch {
-    return false
+  const candidates = [
+    headerValue(req.headers, 'host'),
+    firstToken(headerValue(req.headers, 'x-forwarded-host')),
+  ]
+  for (const candidate of candidates) {
+    if (candidate === undefined) continue
+    try {
+      if (new URL(origin).host === new URL(`http://${candidate}`).host) return true
+    } catch {
+      // An unparsable candidate cannot match; try the next one.
+    }
   }
+  return false
 }
 
 /**
@@ -329,6 +346,14 @@ export function createLoginGateway(config: ResolvedConfig, deps: LoginGatewayDep
         redirect(res, safeNext(url.searchParams.get('next')) ?? '/')
         return
       }
+      // Recover when the last account disappeared — its record was deleted, or
+      // a credential file was restored from a backup. The sign-in form becomes
+      // the setup form again instead of locking everyone out.
+      if (await deps.users.isEmpty()) {
+        configured = false
+        await handleSetup(req, res, url)
+        return
+      }
       sendHtml(res, 200, renderLoginPage({
         issuer: config.issuer,
         loginPath: config.loginPath,
@@ -390,6 +415,16 @@ export function createLoginGateway(config: ResolvedConfig, deps: LoginGatewayDep
     if (user === undefined) {
       // Spend one derivation so an unknown username is not answered faster.
       await dummyPasswordVerify(password)
+      // No account exists at all: this is first-run setup, not a failed login.
+      if (await deps.users.isEmpty()) {
+        configured = false
+        sendHtml(res, 200, renderSetupPage({
+          issuer: config.issuer,
+          loginPath: config.loginPath,
+          minPasswordLength: MIN_SETUP_PASSWORD_LENGTH,
+        }), false)
+        return
+      }
     } else {
       const passwordOk = await verifyPassword(password, user.passwordHash)
       const otpOk = verifyTotp(user.totpSecret, otp, config.totp, now())
