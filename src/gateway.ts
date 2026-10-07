@@ -151,10 +151,32 @@ function tokenMatches(actual: string | undefined, expected: string): boolean {
   return actualBytes.byteLength === expectedBytes.byteLength && timingSafeEqual(actualBytes, expectedBytes)
 }
 
-/** Whether the peer is on loopback, judged from the socket and never from a header. */
+/**
+ * Headers a reverse proxy adds. A browser cannot set them, so their presence
+ * means the request was relayed even though the socket peer is loopback.
+ */
+const FORWARDING_HEADERS = [
+  'x-forwarded-for',
+  'x-forwarded-host',
+  'x-real-ip',
+  'cf-connecting-ip',
+  'forwarded',
+] as const
+
+/**
+ * Whether the request came straight from the local machine.
+ *
+ * A tunnel or reverse proxy connects from loopback, so a loopback socket alone
+ * does not mean local: without this, every internet visitor would look like the
+ * operator and could claim the first account. A forwarding header marks the
+ * request as relayed, and setup then requires the one-time token.
+ * @param req - the incoming request.
+ * @returns true only for a direct loopback request carrying no forwarding header.
+ */
 function isLoopbackPeer(req: IncomingMessage): boolean {
   const address = req.socket.remoteAddress
-  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
+  if (address !== '127.0.0.1' && address !== '::1' && address !== '::ffff:127.0.0.1') return false
+  return FORWARDING_HEADERS.every(name => headerValue(req.headers, name) === undefined)
 }
 
 function forwardedProto(req: IncomingMessage): string {

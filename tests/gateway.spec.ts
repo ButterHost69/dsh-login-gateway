@@ -1,6 +1,7 @@
 import { connect } from 'node:net'
 import type { Socket } from 'node:net'
 import { request as httpRequest } from 'node:http'
+import type { IncomingHttpHeaders } from 'node:http'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { resolveConfig, type LoginGatewayConfig } from '../src/config.ts'
 import { createLoginGateway, type LoginGateway } from '../src/gateway.ts'
@@ -54,28 +55,36 @@ async function login(options: {
 }
 
 /**
- * POST with full control over the request headers, which `fetch` forbids for
- * `Host`. Used to stand in for a tunnel that rewrites it.
+ * Send a request with full control over its headers, which `fetch` forbids for
+ * `Host` and `X-Forwarded-*`. Used to stand in for a proxy or tunnel.
  */
-function postWithHeaders(
+function requestWithHeaders(
+  method: string,
   target: string,
   path: string,
   headers: Record<string, string>,
-  body: string,
-): Promise<{ status: number; body: string }> {
+  body?: string,
+): Promise<{ status: number; body: string; headers: IncomingHttpHeaders }> {
   return new Promise((resolve, reject) => {
     const url = new URL(target)
+    const payload = body ?? ''
     const request = httpRequest({
       host: url.hostname,
       port: url.port,
       path,
-      method: 'POST',
-      headers: { ...headers, 'content-length': String(Buffer.byteLength(body)) },
+      method,
+      headers: body === undefined
+        ? headers
+        : { ...headers, 'content-length': String(Buffer.byteLength(payload)) },
     }, (response) => {
       const chunks: Buffer[] = []
       response.on('data', (chunk: Buffer) => { chunks.push(chunk) })
       response.on('end', () => {
-        resolve({ status: response.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') })
+        resolve({
+          status: response.statusCode ?? 0,
+          body: Buffer.concat(chunks).toString('utf8'),
+          headers: response.headers,
+        })
       })
     })
     request.on('error', reject)
@@ -485,7 +494,7 @@ describe('first-run setup', () => {
   })
 
   it('accepts a same-origin post when a proxy rewrote Host', async () => {
-    const response = await postWithHeaders(setupBase, '/login', {
+    const response = await requestWithHeaders('POST', setupBase, '/login', {
       // What a tunnel that does not preserve Host sends, while the browser's
       // own Fetch Metadata still says the request is same-origin.
       host: '127.0.0.1:9',
@@ -502,7 +511,7 @@ describe('first-run setup', () => {
   })
 
   it('still refuses a cross-site post that claims nothing', async () => {
-    const response = await postWithHeaders(setupBase, '/login', {
+    const response = await requestWithHeaders('POST', setupBase, '/login', {
       host: '127.0.0.1:9',
       origin: 'https://evil.example',
       'sec-fetch-site': 'cross-site',
@@ -517,9 +526,21 @@ describe('first-run setup', () => {
   })
 
   it('falls back to X-Forwarded-Host without Fetch Metadata', async () => {
-    const response = await postWithHeaders(setupBase, '/login', {
+    // X-Forwarded-Host also marks the request as proxied, so setup needs the
+    // token; the point of this case is the Origin comparison itself.
+    const exchange = await requestWithHeaders(
+      'GET',
+      setupBase,
+      `/login?setup=${setupGateway.setupToken}`,
+      { 'x-forwarded-host': 'harness.example.com' },
+    )
+    const cookie = (exchange.headers['set-cookie'] ?? [])
+      .map(String)
+      .find(value => value.startsWith('dsh_login_setup='))?.split(';')[0] ?? ''
+    const response = await requestWithHeaders('POST', setupBase, '/login', {
       host: '127.0.0.1:9',
       'x-forwarded-host': 'harness.example.com',
+      cookie,
       origin: 'https://harness.example.com',
       'content-type': 'application/x-www-form-urlencoded',
     }, new URLSearchParams({
@@ -529,6 +550,49 @@ describe('first-run setup', () => {
     }).toString())
     expect(response.status).toBe(200)
     expect(response.body).toContain('Add the authenticator')
+  })
+
+  it('refuses setup to a proxied request that only looks loopback', async () => {
+    const response = await requestWithHeaders('POST', setupBase, '/login', {
+      // A tunnel connects from loopback and adds this header.
+      'x-forwarded-for': '203.0.113.9',
+      origin: setupBase,
+      'content-type': 'application/x-www-form-urlencoded',
+    }, new URLSearchParams({
+      username: 'proxied',
+      password: SETUP_PASSWORD,
+      confirm: SETUP_PASSWORD,
+    }).toString())
+    expect(response.status).toBe(403)
+    expect(response.body).toContain('Setup is local-only')
+    expect(credentials.records.size).toBe(0)
+  })
+
+  it('allows a proxied setup that presents the one-time token', async () => {
+    const exchange = await requestWithHeaders(
+      'GET',
+      setupBase,
+      `/login?setup=${setupGateway.setupToken}`,
+      { 'x-forwarded-for': '203.0.113.9' },
+    )
+    expect(exchange.status).toBe(303)
+    const setCookie = exchange.headers['set-cookie'] ?? []
+    const cookie = setCookie.map(String).find(value => value.startsWith('dsh_login_setup='))?.split(';')[0] ?? ''
+    expect(cookie).not.toBe('')
+
+    const created = await requestWithHeaders('POST', setupBase, '/login', {
+      'x-forwarded-for': '203.0.113.9',
+      cookie,
+      origin: 'https://harness.example.com',
+      'sec-fetch-site': 'same-origin',
+      'content-type': 'application/x-www-form-urlencoded',
+    }, new URLSearchParams({
+      username: 'proxied',
+      password: SETUP_PASSWORD,
+      confirm: SETUP_PASSWORD,
+    }).toString())
+    expect(created.status).toBe(200)
+    expect(created.body).toContain('Add the authenticator')
   })
 
   it('returns to setup when the last stored account disappears', async () => {
