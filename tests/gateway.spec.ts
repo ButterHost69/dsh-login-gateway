@@ -178,6 +178,16 @@ describe('gateway routing', () => {
     await expect(response.json()).resolves.toEqual({ error: 'unauthorized' })
   })
 
+  it('proxies the credential-less web app manifest fetch', async () => {
+    const manifest = await fetch(`${base}/manifest.webmanifest`, {
+      headers: { 'sec-fetch-dest': 'manifest' },
+    })
+    expect(manifest.status).toBe(200)
+    // Without the Fetch Metadata marker it stays gated.
+    const gated = await fetch(`${base}/manifest.webmanifest`)
+    expect(gated.status).toBe(401)
+  })
+
   it('serves the login form and the health endpoint without a session', async () => {
     const form = await fetch(`${base}/login`, { headers: { 'sec-fetch-dest': 'document' } })
     expect(form.status).toBe(200)

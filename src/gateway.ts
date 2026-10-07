@@ -695,6 +695,13 @@ export function createLoginGateway(config: ResolvedConfig, deps: LoginGatewayDep
       return
     }
     if (sessions.verify(cookieValue(req.headers.cookie, config.session.cookieName)) === undefined) {
+      // A browser fetches the web app manifest without credentials, and the
+      // harness serves everything but its dist root and index publicly, so
+      // gating this request only produces a 401 in the console.
+      if (headerValue(req.headers, 'sec-fetch-dest') === 'manifest') {
+        await forward(req, res)
+        return
+      }
       if (wantsHtml(req)) {
         redirect(res, loginRedirect(url))
         return
