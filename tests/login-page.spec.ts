@@ -52,6 +52,14 @@ describe('renderLoginPage', () => {
     expect(html).toContain('banner notice')
     expect(html).toContain('Signed out.')
   })
+
+  it('renders one labelled card with no scripts or inline handlers', () => {
+    const html = renderLoginPage({ issuer: 'Harness', loginPath: '/login', digits: 6 })
+    expect(html).toContain('<main aria-labelledby="page-title">')
+    expect(html).toContain('<h1 id="page-title">Sign in</h1>')
+    expect(html).not.toContain('<script')
+    expect(html).not.toContain('onfocus=')
+  })
 })
 
 describe('renderNoticePage', () => {
@@ -84,7 +92,7 @@ describe('renderSetupPage', () => {
     expect(html).toContain('name="confirm"')
     expect(html).toContain('minlength="12"')
     expect(html).toContain('pattern="[a-z][a-z0-9-]{1,31}"')
-    expect(html).toContain('at least 12 characters')
+    expect(html).toContain('Use at least 12 characters.')
   })
 
   it('escapes the error and the prefilled username', () => {

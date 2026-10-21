@@ -26,6 +26,7 @@ This plugin adds a real login — the kind you can hand to a person or keep in a
 - Performs the harness's own launch-token → cookie exchange **server-side**, so neither the launch token nor the harness's cookie ever reaches the browser.
 - Asks for the first username and password when none is configured, generating the TOTP secret and storing the account as a credential record.
 - Throttles failed sign-ins per client address and per username.
+- Serves theme-aware login, setup, enrollment, and notice pages in the visual language of the harness settings dialogs.
 
 ## Requirements
 
